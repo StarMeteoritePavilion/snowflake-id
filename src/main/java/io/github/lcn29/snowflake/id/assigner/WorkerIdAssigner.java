@@ -22,4 +22,5 @@ public interface WorkerIdAssigner {
      */
     default void appClose() {
     }
+
 }

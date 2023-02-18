@@ -28,9 +28,41 @@ import java.util.concurrent.TimeoutException;
  * @author lcn29
  * @date 2023-02-15 23:12
  */
-public class DefaultWorkIdAssigner implements WorkerIdAssigner {
+public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
 
-    private static final Logger logger = LoggerFactory.getLogger(DefaultWorkIdAssigner.class);
+    private static final Logger logger = LoggerFactory.getLogger(ZooKeeperWorkIdAssigner.class);
+
+    private static final String DELIMITER = "/";
+
+    /**
+     * ZooKeeper 连接超时时间
+     */
+    private static final int CONNECTION_TIMEOUT_MS = 5000;
+
+    /**
+     * ZooKeeper 会话超时时间
+     */
+    private static final int SESSION_TIMEOUT_MS = 5000;
+
+    /**
+     * 重连机制, 2 次重连的时间间隔
+     */
+    private static final int BASE_SLEEP_TIME_MS = 1000;
+
+    /**
+     * 重试机制, 最多的尝试次数
+     */
+    private static final int MAX_RETRIES = 3;
+
+    /**
+     * 获取 ZooKeeper 分布式锁的超时时间
+     */
+    private static final long GET_LOCK_TIMEOUT = 5000L;
+
+    /**
+     * 存储在 ZooKeeper 节点的数据格式
+     */
+    private static final String ZOOKEEPER_NODE_DATA_FORMAT = "[ip:%s,host:%s,pid:%s]";
 
     /**
      * 根路径
@@ -45,7 +77,7 @@ public class DefaultWorkIdAssigner implements WorkerIdAssigner {
     /**
      * 当前的 workId
      */
-    private int curWorkId;
+    private volatile int curWorkId;
 
     /**
      * 应用的 appName
@@ -67,7 +99,7 @@ public class DefaultWorkIdAssigner implements WorkerIdAssigner {
      */
     private CuratorFramework curatorFramework;
 
-    public DefaultWorkIdAssigner(String appName, String zooKeeperUrl, int zooKeeperPort) {
+    public ZooKeeperWorkIdAssigner(String appName, String zooKeeperUrl, int zooKeeperPort) {
         this.appName = appName;
         this.zooKeeperUrl = zooKeeperUrl;
         this.zooKeeperPort = zooKeeperPort;
@@ -105,10 +137,10 @@ public class DefaultWorkIdAssigner implements WorkerIdAssigner {
         // 创建 ZooKeeper 客户端
         this.curatorFramework = CuratorFrameworkFactory.builder()
                 .connectString(zooKeeperConnectString)
-                .connectionTimeoutMs(Constants.CONNECTION_TIMEOUT_MS)
-                .sessionTimeoutMs(Constants.SESSION_TIMEOUT_MS)
+                .connectionTimeoutMs(CONNECTION_TIMEOUT_MS)
+                .sessionTimeoutMs(SESSION_TIMEOUT_MS)
                 // 设置重试机制
-                .retryPolicy(new ExponentialBackoffRetry(Constants.BASE_SLEEP_TIME_MS, Constants.MAX_RETRIES))
+                .retryPolicy(new ExponentialBackoffRetry(BASE_SLEEP_TIME_MS, MAX_RETRIES))
                 .build();
         // 启动应用
         this.curatorFramework.start();
@@ -124,14 +156,14 @@ public class DefaultWorkIdAssigner implements WorkerIdAssigner {
             throw new RuntimeException("[SnowFlakeId]ZooKeeper client not found");
         }
 
-        String curAppPath = ROOT_PATH + Constants.DELIMITER + this.appName;
+        String curAppPath = ROOT_PATH + DELIMITER + this.appName;
         String curAppLockPath = curAppPath + LOCK_PATH;
 
         InterProcessMutex interProcessMutex = new InterProcessMutex(this.curatorFramework, curAppPath);
 
         try {
             // interProcessMutex 声明的路径会在获取锁时创建出来
-            if (!interProcessMutex.acquire(Constants.GET_LOCK_TIMEOUT, TimeUnit.MILLISECONDS)) {
+            if (!interProcessMutex.acquire(GET_LOCK_TIMEOUT, TimeUnit.MILLISECONDS)) {
                 throw new TimeoutException("[SnowFlakeId]acquire ZooKeeper distributed lock time");
             }
             Stat curAppLockPathStat = this.curatorFramework.checkExists().forPath(curAppLockPath);
@@ -162,12 +194,12 @@ public class DefaultWorkIdAssigner implements WorkerIdAssigner {
                 }
 
                 // 最终维护在 ZooKeeper 的路径
-                String curNodePath = curAppLockPath + Constants.DELIMITER + index;
+                String curNodePath = curAppLockPath + DELIMITER + index;
                 String nodeData = String.format(
-                        Constants.ZOOKEEPER_NODE_DATA_FORMAT,
+                        ZOOKEEPER_NODE_DATA_FORMAT,
                         InetAddress.getLocalHost().getHostAddress(),
                         InetAddress.getLocalHost().getHostName(),
-                        ManagementFactory.getRuntimeMXBean().getName().split("@")[0]
+                        ManagementFactory.getRuntimeMXBean().getName().split(Constants.PID_DELIMITER)[0]
                 );
 
                 try {
@@ -180,13 +212,15 @@ public class DefaultWorkIdAssigner implements WorkerIdAssigner {
                 TreeCache treeCache = new TreeCache(this.curatorFramework, curNodePath);
 
                 treeCache.getListenable().addListener((curatorFramework, treeCacheEvent) -> {
-                    long pathCreatTime = 0;
+                    long pathCreatTime;
                     try {
                         pathCreatTime = curatorFramework.checkExists().forPath(curNodePath).getCtime();
                     } catch (Exception e) {
                         pathCreatTime = 0;
                     }
-
+                    // pathCreatTime 改变了, 那么只能一种情况:
+                    // 当前应用与 zk 失去联系, 且 {curNodePath} 不存在或者被其它应用占据了 (表象为 pathCreatTime 变化)
+                    // 无论哪种情况,当前应用都要重新注册节点
                     if (pathCreatTime != curNodePathCreateTime) {
                         logger.info("[SnowFlakeId] disconnect with ZooKeeper, try reconnection ...");
                         try {

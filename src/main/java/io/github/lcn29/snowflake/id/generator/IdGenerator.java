@@ -1,7 +1,5 @@
 package io.github.lcn29.snowflake.id.generator;
 
-import java.util.List;
-
 /**
  * <pre>
  * 雪花 id 生产器
@@ -20,10 +18,8 @@ public interface IdGenerator {
     Long generate();
 
     /**
-     * 批量产生多个雪花 id
-     *
-     * @param size 需要的雪花 id 个数
-     * @return 雪花 id 列表
+     * 应用关闭回调
      */
-    List<Long> batchGenerate(int size);
+    default void appClose() {
+    }
 }
