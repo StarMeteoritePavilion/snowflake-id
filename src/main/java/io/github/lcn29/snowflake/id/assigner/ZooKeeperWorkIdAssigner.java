@@ -3,6 +3,7 @@ package io.github.lcn29.snowflake.id.assigner;
 import io.github.lcn29.snowflake.id.Constants;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.imps.CuratorFrameworkState;
 import org.apache.curator.framework.recipes.cache.TreeCache;
 import org.apache.curator.framework.recipes.locks.InterProcessMutex;
 import org.apache.curator.retry.ExponentialBackoffRetry;
@@ -16,6 +17,7 @@ import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -32,7 +34,15 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
 
     private static final Logger logger = LoggerFactory.getLogger(ZooKeeperWorkIdAssigner.class);
 
+    /**
+     * 路径分隔符
+     */
     private static final String DELIMITER = "/";
+
+    /**
+     * 冒号
+     */
+    private static final String COLON = ":";
 
     /**
      * ZooKeeper 连接超时时间
@@ -65,7 +75,7 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
     private static final String ZOOKEEPER_NODE_DATA_FORMAT = "[ip:%s,host:%s,pid:%s]";
 
     /**
-     * 根路径
+     * workId 注册的节点根路径
      */
     private static final String ROOT_PATH = "/snowflake/workId";
 
@@ -75,35 +85,37 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
     private static final String LOCK_PATH = "/lockId";
 
     /**
-     * 当前的 workId
-     */
-    private volatile int curWorkId;
-
-    /**
      * 应用的 appName
      */
     private final String appName;
 
     /**
-     * ZooKeeper 的地址
+     * ZooKeeper 连接地址字符串, 地址:端口
      */
-    private final String zooKeeperUrl;
-
-    /**
-     * ZooKeeper 的端口
-     */
-    private final int zooKeeperPort;
+    private final String zooKeeperConnectString;
 
     /**
      * ZooKeeper 连接客户端
      */
     private CuratorFramework curatorFramework;
 
+    /**
+     * ZooKeeper 注册的 worker id 节点的监听器
+     */
+    private TreeCache treeCache;
+
+    /**
+     * 当前的 workId
+     */
+    private volatile int curWorkId;
+
     public ZooKeeperWorkIdAssigner(String appName, String zooKeeperUrl, int zooKeeperPort) {
         this.appName = appName;
-        this.zooKeeperUrl = zooKeeperUrl;
-        this.zooKeeperPort = zooKeeperPort;
-        this.init();
+        this.zooKeeperConnectString = zooKeeperUrl + COLON + zooKeeperPort;
+        // 创建客户端
+        this.createCuratorFramework();
+        // 注册路径 + 分配 work id
+        this.allocateWorkId();
     }
 
     @Override
@@ -113,17 +125,14 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
 
     @Override
     public void appClose() {
-        // 应用关闭时, 关闭客户端连接
-        if (curatorFramework != null) {
-            this.curatorFramework.close();
-        }
+        Optional.ofNullable(this.treeCache).ifPresent(TreeCache::close);
+        Optional.ofNullable(this.curatorFramework).ifPresent(CuratorFramework::close);
     }
 
     /**
-     * WorkIdAssigner 初始化
+     * 创建与 ZooKeeper 连接的客户端 CuratorFramework
      */
-    private void init() {
-
+    private void createCuratorFramework() {
         if (this.appName == null || this.appName.trim().length() == 0) {
             throw new RuntimeException("[SnowFlakeId]appName can not be empty !");
         }
@@ -131,8 +140,6 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
         if (this.curatorFramework != null) {
             this.curatorFramework.close();
         }
-        // ZooKeeper 连接的字符串, 地址:端口
-        String zooKeeperConnectString = this.zooKeeperUrl + ":" + this.zooKeeperPort;
 
         // 创建 ZooKeeper 客户端
         this.curatorFramework = CuratorFrameworkFactory.builder()
@@ -142,18 +149,20 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
                 // 设置重试机制
                 .retryPolicy(new ExponentialBackoffRetry(BASE_SLEEP_TIME_MS, MAX_RETRIES))
                 .build();
-        // 启动应用
+        // 启动
         this.curatorFramework.start();
-        // 开始分配 work id
-        this.allocationWorkId();
     }
 
     /**
      * 分配 work id
      */
-    private void allocationWorkId() {
+    private void allocateWorkId() {
         if (this.curatorFramework == null) {
             throw new RuntimeException("[SnowFlakeId]ZooKeeper client not found");
+        }
+
+        if (this.curatorFramework.getState() == CuratorFrameworkState.STOPPED) {
+            this.curatorFramework.start();
         }
 
         String curAppPath = ROOT_PATH + DELIMITER + this.appName;
@@ -203,37 +212,14 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
                 );
 
                 try {
+                    // 创建节点
                     this.curatorFramework.create().withMode(CreateMode.EPHEMERAL).forPath(curNodePath, nodeData.getBytes(StandardCharsets.UTF_8));
                 } catch (Exception e) {
                     logger.error("[SnowFlakeId] Node:[{}] creat fail, maybe exist", curNodePath);
                 }
 
-                long curNodePathCreateTime = this.curatorFramework.checkExists().forPath(curNodePath).getCtime();
-                TreeCache treeCache = new TreeCache(this.curatorFramework, curNodePath);
-
-                treeCache.getListenable().addListener((curatorFramework, treeCacheEvent) -> {
-                    long pathCreatTime;
-                    try {
-                        pathCreatTime = curatorFramework.checkExists().forPath(curNodePath).getCtime();
-                    } catch (Exception e) {
-                        pathCreatTime = 0;
-                    }
-                    // pathCreatTime 改变了, 那么只能一种情况:
-                    // 当前应用与 zk 失去联系, 且 {curNodePath} 不存在或者被其它应用占据了 (表象为 pathCreatTime 变化)
-                    // 无论哪种情况,当前应用都要重新注册节点
-                    if (pathCreatTime != curNodePathCreateTime) {
-                        logger.info("[SnowFlakeId] disconnect with ZooKeeper, try reconnection ...");
-                        try {
-                            treeCache.close();
-                        } catch (Exception e) {
-                            logger.error("[SnowFlakeId] TreeCache close fail");
-                        }
-                        // 重新分配
-                        allocationWorkId();
-                    }
-                });
-
-                treeCache.start();
+                this.treeCache = createTreeCache(curAppPath);
+                this.treeCache.start();
                 this.curWorkId = index;
                 logger.info("[SnowFlakeId] ZooKeeper connect success, the workId is :{}", index);
                 return;
@@ -249,6 +235,47 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
     }
 
     /**
+     * 创建 TreeCache
+     *
+     * @param watchPath 需要监听的路径
+     * @return TreeCache 对象
+     * @throws Exception
+     */
+    private TreeCache createTreeCache(String watchPath) throws Exception {
+
+        TreeCache treeCache = new TreeCache(this.curatorFramework, watchPath);
+        long watchPathCreatTime = this.curatorFramework.checkExists().forPath(watchPath).getCtime();
+
+        // 建立监听器, 在 ZooKeeper 节点有变更时, 进行更新
+        treeCache.getListenable().addListener((client, treeCacheEvent) -> {
+            long pathCreatTime;
+
+            try {
+                // 获取当前监听节点的创建时间
+                pathCreatTime = this.curatorFramework.checkExists().forPath(watchPath).getCtime();
+            } catch (Exception e) {
+                logger.error("[SnowFlackId]the tree cache listener exception", e);
+                pathCreatTime = 0;
+            }
+            // pathCreatTime 改变了, 那么只能一种情况:
+            // 当前应用与 zk 失去联系, 且 {curNodePath} 不存在或者被其它应用占据了 (表象为 pathCreatTime 变化)
+            // 无论哪种情况,当前应用都要重新注册节点
+            if (pathCreatTime != watchPathCreatTime) {
+                logger.info("[SnowFlakeId] disconnect with ZooKeeper, try reconnection ...");
+                try {
+                    treeCache.close();
+                } catch (Exception e) {
+                    logger.error("[SnowFlakeId] TreeCache close fail");
+                }
+                // 重新分配
+                allocateWorkId();
+            }
+        });
+
+        return treeCache;
+    }
+
+    /**
      * ZooKeeper 分布式锁释放
      *
      * @param interProcessMutex 分布式锁
@@ -261,4 +288,5 @@ public class ZooKeeperWorkIdAssigner implements WorkerIdAssigner {
             throw new RuntimeException("[SnowFlakeId]distributed ZooKeeper Lock release fail");
         }
     }
+    
 }
