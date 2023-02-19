@@ -21,7 +21,7 @@ import java.util.concurrent.CountDownLatch;
 public class IdGeneratorTest {
 
     // ZooKeeper 的地址
-    private static String zooKeeperUrl = "sr-test-zk-cluster-1.gz.cvte.cn";
+    private static String zooKeeperUrl = "localhost";
 
     // ZooKeeper 的端口
     private static int zooKeeperPort = 2181;
